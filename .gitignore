@@ -1,0 +1,26 @@
+﻿# Visual Studio
+.vs/
+*.suo
+*.opensdf
+*.sdf
+*.VC.db
+*.VC.opendb
+*.sln
+
+# Unreal generated files
+Binaries/
+DerivedDataCache/
+Intermediate/
+Saved/
+
+# Generated folders inside plugins/modules
+**/Binaries/
+**/Intermediate/
+
+# Local backups / conversion artifacts
+Backup/
+UpgradeLog.htm
+
+# OS
+Thumbs.db
+Desktop.ini
