@@ -6,7 +6,7 @@
 
 #include "PCGExportSyntheticPointCloudSettings.generated.h"
 
-/** Exports semantic surface samples from PCG static-mesh instances while passing the input points through unchanged. */
+/** Exports semantic surface samples and summary.json instance counts while passing the input points through unchanged. */
 UCLASS(BlueprintType, ClassGroup = (Procedural), meta = (Keywords = "export synthetic point cloud semantic txt ply"))
 class TESTPROJECT_API UPCGExportSyntheticPointCloudSettings : public UPCGSettings
 {

@@ -4,6 +4,7 @@
 
 #include "PCGContext.h"
 #include "Data/PCGBasePointData.h"
+#include "Dom/JsonObject.h"
 #include "Engine/StaticMesh.h"
 #include "HAL/PlatformFileManager.h"
 #include "Metadata/Accessors/PCGAttributeAccessorHelpers.h"
@@ -12,6 +13,7 @@
 #include "Misc/Guid.h"
 #include "Misc/Paths.h"
 #include "Rendering/PositionVertexBuffer.h"
+#include "Serialization/JsonSerializer.h"
 #include "StaticMeshResources.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(PCGExportSyntheticPointCloudSettings)
@@ -26,6 +28,8 @@ namespace PCGExportSyntheticPointCloud
 		const FName ClassIdAttributeName = TEXT("ClassId");
 		const FName InstanceIdAttributeName = TEXT("InstanceId");
 		const FName LayerIndexAttributeName = TEXT("LayerIndex");
+		// /Game/DIPLOMA: AddAttribute_15 assigns the unique brick_stack dataset class.
+		constexpr int32 BrickClassId = 3;
 		constexpr double SquareCentimetersToSquareMeters = 0.0001;
 		constexpr double CentimetersToMeters = 0.01;
 		constexpr double MinTriangleAreaSquareCentimeters = 1.0e-12;
@@ -299,6 +303,38 @@ namespace PCGExportSyntheticPointCloud
 		return FFileHelper::SaveArrayToFile(MakeArrayView(Bytes), *Path);
 	}
 
+	bool WriteSummaryTemporaryFile(
+		const FString& Path,
+		const TMap<int32, int32>& InstanceCountsByClass,
+		const TMap<int32, TSet<int32>>& UniqueInstanceIdsByClass)
+	{
+		TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+		// TODO(SceneSeed): pass an explicit scene-level seed through the dataset pipeline.
+		// SamplingSeed and the combined PCG execution seed are not the scene seed.
+		Root->SetField(TEXT("scene_seed"), MakeShared<FJsonValueNull>());
+		TSharedRef<FJsonObject> Classes = MakeShared<FJsonObject>();
+		TArray<int32> ClassIds;
+		InstanceCountsByClass.GetKeys(ClassIds);
+		ClassIds.AddUnique(Constants::BrickClassId); // Include zero bricks if this class is absent.
+		ClassIds.Sort();
+		for (const int32 ClassId : ClassIds)
+		{
+			const int32 InstanceCount = InstanceCountsByClass.FindRef(ClassId);
+			const TSet<int32>* UniqueIds = UniqueInstanceIdsByClass.Find(ClassId);
+			const int32 UniqueCount = UniqueIds ? UniqueIds->Num() : 0;
+			TSharedRef<FJsonObject> Class = MakeShared<FJsonObject>();
+			Class->SetNumberField(TEXT("class_id"), ClassId);
+			Class->SetNumberField(TEXT("instance_count"), InstanceCount);
+			Class->SetNumberField(TEXT("unique_instance_count"), UniqueCount);
+			Class->SetBoolField(TEXT("instance_ids_unique"), InstanceCount == UniqueCount);
+			Classes->SetObjectField(ClassId == Constants::BrickClassId ? TEXT("brick") : FString::Printf(TEXT("class_%d"), ClassId), Class);
+		}
+		Root->SetObjectField(TEXT("classes"), Classes);
+		FString Json;
+		return FJsonSerializer::Serialize(Root, TJsonWriterFactory<>::Create(&Json)) &&
+			FFileHelper::SaveStringToFile(Json, *Path, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+	}
+
 	void CleanupTemporaryFiles(IPlatformFile& PlatformFile, TArray<FPendingOutput>& Outputs)
 	{
 		for (FPendingOutput& Output : Outputs)
@@ -436,6 +472,7 @@ bool FPCGExportSyntheticPointCloudElement::ExecuteInternal(FPCGContext* Context)
 
 	TArray<PCGExportSyntheticPointCloud::FTriangle> Triangles;
 	TMap<int32, int32> InstanceCountsByClass;
+	TMap<int32, TSet<int32>> UniqueInstanceIdsByClass;
 	TSet<int32> UniqueInstanceIds;
 	bool bFoundDuplicateInstanceId = false;
 	int32 InputInstanceCount = 0;
@@ -487,6 +524,7 @@ bool FPCGExportSyntheticPointCloudElement::ExecuteInternal(FPCGContext* Context)
 				*MeshPath.ToString());
 
 			InstanceCountsByClass.FindOrAdd(ClassId)++;
+			UniqueInstanceIdsByClass.FindOrAdd(ClassId).Add(InstanceId);
 			if (UniqueInstanceIds.Contains(InstanceId))
 			{
 				bFoundDuplicateInstanceId = true;
@@ -641,6 +679,7 @@ bool FPCGExportSyntheticPointCloudElement::ExecuteInternal(FPCGContext* Context)
 	const FString TransactionId = FGuid::NewGuid().ToString(EGuidFormats::Digits);
 	const FString TxtPath = FPaths::Combine(OutputDirectory, Settings->BaseFileName + TEXT("_points.txt"));
 	const FString PlyPath = FPaths::Combine(OutputDirectory, Settings->BaseFileName + TEXT("_points.ply"));
+	const FString SummaryPath = FPaths::Combine(OutputDirectory, TEXT("summary.json"));
 	TArray<PCGExportSyntheticPointCloud::FPendingOutput> PendingOutputs;
 
 	if (Settings->bWriteTxt)
@@ -667,6 +706,16 @@ bool FPCGExportSyntheticPointCloudElement::ExecuteInternal(FPCGContext* Context)
 			PCGExportSyntheticPointCloud::CleanupTemporaryFiles(PlatformFile, PendingOutputs);
 			return AbortExport(FString::Printf(TEXT("Failed to write temporary PLY output '%s'."), *Output.TemporaryPath));
 		}
+	}
+
+	PCGExportSyntheticPointCloud::FPendingOutput& SummaryOutput = PendingOutputs.Emplace_GetRef();
+	SummaryOutput.FinalPath = SummaryPath;
+	SummaryOutput.TemporaryPath = SummaryPath + TEXT(".tmp.") + TransactionId;
+	SummaryOutput.BackupPath = SummaryPath + TEXT(".bak.") + TransactionId;
+	if (!PCGExportSyntheticPointCloud::WriteSummaryTemporaryFile(SummaryOutput.TemporaryPath, InstanceCountsByClass, UniqueInstanceIdsByClass))
+	{
+		PCGExportSyntheticPointCloud::CleanupTemporaryFiles(PlatformFile, PendingOutputs);
+		return AbortExport(FString::Printf(TEXT("Failed to write temporary summary output '%s'."), *SummaryOutput.TemporaryPath));
 	}
 
 	FString CommitError;
@@ -702,7 +751,8 @@ bool FPCGExportSyntheticPointCloudElement::ExecuteInternal(FPCGContext* Context)
 		TEXT("Class counts by INSTANCE:%s\n")
 		TEXT("Point counts by ClassId:%s\n")
 		TEXT("TXT = %s\n")
-		TEXT("PLY = %s"),
+		TEXT("PLY = %s\n")
+		TEXT("Summary = %s"),
 		InputInstanceCount,
 		Triangles.Num(),
 		*TotalAreaMetersText,
@@ -714,7 +764,8 @@ bool FPCGExportSyntheticPointCloudElement::ExecuteInternal(FPCGContext* Context)
 		*PCGExportSyntheticPointCloud::FormatClassCounts(InstanceCountsByClass),
 		*PCGExportSyntheticPointCloud::FormatClassCounts(PointCountsByClass),
 		Settings->bWriteTxt ? *TxtPath : TEXT("disabled"),
-		Settings->bWritePly ? *PlyPath : TEXT("disabled"));
+		Settings->bWritePly ? *PlyPath : TEXT("disabled"),
+		*SummaryPath);
 	PCGE_LOG_C(Display, GraphAndLog, Context, FText::FromString(Summary));
 
 	return true;
