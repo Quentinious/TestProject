@@ -4,6 +4,7 @@
 
 #include "PCG/PCGExportSyntheticPointCloudSettings.h"
 #include "PCGContext.h"
+#include "PCGComponent.h"
 #include "Data/PCGPointArrayData.h"
 #include "Dom/JsonObject.h"
 #include "HAL/PlatformFileManager.h"
@@ -40,7 +41,7 @@ namespace GroundTruthExportTests
 		return Data;
 	}
 
-	TUniquePtr<FPCGContext> Export(UPCGExportSyntheticPointCloudSettings* Settings, const TArray<UPCGBasePointData*>& Batches)
+	TUniquePtr<FPCGContext> Export(UPCGExportSyntheticPointCloudSettings* Settings, const TArray<UPCGBasePointData*>& Batches, UPCGComponent* Component = nullptr)
 	{
 		FPCGDataCollection Input;
 		FPCGTaggedData& SettingsInput = Input.TaggedData.Emplace_GetRef();
@@ -54,7 +55,7 @@ namespace GroundTruthExportTests
 		}
 		Input.ComputeCrcs(false);
 		const FPCGElementPtr Element = Settings->GetElement();
-		TUniquePtr<FPCGContext> Context(Element->Initialize(FPCGInitializeElementParams(&Input, nullptr, nullptr)));
+		TUniquePtr<FPCGContext> Context(Element->Initialize(FPCGInitializeElementParams(&Input, Component, nullptr)));
 		Context->InitializeSettings();
 		Context->AsyncState.NumAvailableTasks = 1;
 		while (!Element->Execute(Context.Get())) {}
@@ -174,6 +175,31 @@ bool FGroundTruthExportDuplicatesTest::RunTest(const FString& Parameters)
 	Settings->bExportEnabled = false;
 	Export(Settings.Get(), {Batch.Get()});
 	TestEqual(TEXT("Disabled export preserves previous summary"), ReadSummary(Settings->OutputSubdirectory)->GetObjectField(TEXT("classes"))->GetObjectField(TEXT("brick"))->GetIntegerField(TEXT("instance_count")), 0);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGroundTruthComponentSeedTest, "TestProject.GroundTruth.Export.ComponentSeed", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGroundTruthComponentSeedTest::RunTest(const FString& Parameters)
+{
+	using namespace GroundTruthExportTests;
+	TStrongObjectPtr<UPCGExportSyntheticPointCloudSettings> Settings(NewObject<UPCGExportSyntheticPointCloudSettings>());
+	Settings->bExportEnabled = true;
+	Settings->TargetPointCount = 1;
+	Settings->Seed = 987654;
+	Settings->SamplingSeed = 123456;
+	Settings->OutputSubdirectory = TEXT("Automation/GroundTruthExports/") + FGuid::NewGuid().ToString(EGuidFormats::Digits);
+	TStrongObjectPtr<UPCGPointArrayData> Batch(MakeInstances({3}, {99}));
+	TStrongObjectPtr<UPCGComponent> Component(NewObject<UPCGComponent>());
+	for (const int32 Seed : {66, 0, -17})
+	{
+		Component->Seed = Seed;
+		const auto Context = Export(Settings.Get(), {Batch.Get()}, Component.Get());
+		TestTrue(TEXT("Execution context retains the supplied component"), Context->ExecutionSource.Get() == Component.Get());
+		const auto Summary = ReadSummary(Settings->OutputSubdirectory);
+		if (!TestTrue(TEXT("Component-context summary readable"), Summary.IsValid())) { return false; }
+		TestEqual(TEXT("Component seed serialized exactly, including zero and negative values"), Summary->GetIntegerField(TEXT("scene_seed")), Seed);
+	}
 	return true;
 }
 

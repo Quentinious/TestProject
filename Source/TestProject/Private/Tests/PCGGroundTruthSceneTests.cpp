@@ -43,7 +43,8 @@ namespace GroundTruthSceneTests
 	class FValidateScene : public IAutomationLatentCommand
 	{
 	public:
-		FValidateScene(FAutomationTestBase* InTest, const FString& InActorLabel) : Test(InTest), ActorLabel(InActorLabel) {}
+		FValidateScene(FAutomationTestBase* InTest, const FString& InActorLabel, UPCGExportSyntheticPointCloudSettings* InAssetExportSettings, bool bInAssetExportEnabled)
+			: Test(InTest), ActorLabel(InActorLabel), AssetExportSettings(InAssetExportSettings), bAssetExportEnabled(bInAssetExportEnabled) {}
 		virtual ~FValidateScene() override
 		{
 			if (bInspecting && Component.IsValid())
@@ -53,6 +54,7 @@ namespace GroundTruthSceneTests
 				Component->SetGraphLocal(OriginalGraph.Get());
 				Component->bRegenerateInEditor = bOriginalRegenerateInEditor;
 			}
+			AssetExportSettings->bExportEnabled = bAssetExportEnabled;
 		}
 
 		virtual bool Update() override
@@ -101,6 +103,15 @@ namespace GroundTruthSceneTests
 				AfterGraph.Reset(DuplicateObject<UPCGGraph>(Asset, GetTransientPackage()));
 				CastChecked<UPCGAddAttributeSettings>(FindNode(BeforeGraph.Get(), TEXT("AddAttribute_15"))->GetSettings())->AttributeTypes.Int32Value = 0;
 				BeforeGraph->RemoveEdge(FindNode(BeforeGraph.Get(), TEXT("StaticMeshSpawner_12")), TEXT("Out"), FindNode(BeforeGraph.Get(), TEXT("MergePoints_0")), TEXT("In"));
+				CastChecked<UPCGExportSyntheticPointCloudSettings>(FindNode(BeforeGraph.Get(), TEXT("ExportSyntheticPointCloud_0"))->GetSettings())->bExportEnabled = false;
+				// Let the real PCG executor initialize and execute the exporter with
+				// this same scene component, rather than invoking it separately.
+				auto* ExportSettings = CastChecked<UPCGExportSyntheticPointCloudSettings>(FindNode(AfterGraph.Get(), TEXT("ExportSyntheticPointCloud_0"))->GetSettings());
+				ExportSettings->bExportEnabled = true;
+				ExportSettings->TargetPointCount = 128;
+				ExportSettings->Seed = 987654;
+				ExportSettings->SamplingSeed = 123456;
+				ExportSettings->OutputSubdirectory = FPaths::Combine(TEXT("Automation/GroundTruthScene"), ActorLabel, FGuid::NewGuid().ToString(EGuidFormats::Digits));
 				Component->GetExecutionState().GetInspection().EnableInspection();
 				bInspecting = true;
 			}
@@ -115,6 +126,10 @@ namespace GroundTruthSceneTests
 			if (Phase == 1)
 			{
 				if (!Capture(BeforeGraph.Get(), Before)) { return true; }
+				if (Before.ExportClasses.IsEmpty() && Before.BrickTransforms.IsEmpty())
+				{
+					CastChecked<UPCGExportSyntheticPointCloudSettings>(FindNode(AfterGraph.Get(), TEXT("ExportSyntheticPointCloud_0"))->GetSettings())->bExportEnabled = false;
+				}
 				Component->SetGraphLocal(AfterGraph.Get());
 				Component->GenerateLocal(true);
 				Phase = 2;
@@ -143,34 +158,23 @@ namespace GroundTruthSceneTests
 			Test->AddInfo(FString::Printf(TEXT("Actor=%s; current component seed=%d; brick_stack before=%d, after=%d, exporter=%d. No seed parameters were changed and historical 55/51/56 values were not used."), *ActorLabel, ComponentSeed, Before.BrickTransforms.Num(), After.BrickTransforms.Num(), After.ExportClasses.FindRef(3)));
 			if (After.ExportClasses.IsEmpty())
 			{
-				Test->AddInfo(TEXT("Verified empty object stream; no export requested, preserving the existing empty-scene behavior."));
+				Test->AddInfo(TEXT("Verified empty object stream; no export file expected, preserving the existing empty-scene behavior."));
 				return true;
 			}
 
-			TStrongObjectPtr<UPCGExportSyntheticPointCloudSettings> Settings(NewObject<UPCGExportSyntheticPointCloudSettings>());
-			Settings->bExportEnabled = true;
-			Settings->TargetPointCount = 128;
-			Settings->OutputSubdirectory = FPaths::Combine(TEXT("Automation/GroundTruthScene"), ActorLabel, FGuid::NewGuid().ToString(EGuidFormats::Digits));
-			FPCGTaggedData& SettingsInput = After.ExportData.TaggedData.Emplace_GetRef();
-			SettingsInput.Data = Settings.Get();
-			SettingsInput.Pin = TEXT("Settings");
-			After.ExportData.ComputeCrcs(false);
-			const FPCGElementPtr Element = Settings->GetElement();
-			TUniquePtr<FPCGContext> Context(Element->Initialize(FPCGInitializeElementParams(&After.ExportData, Component.Get(), nullptr)));
-			Context->InitializeSettings();
-			Context->AsyncState.NumAvailableTasks = 1;
-			while (!Element->Execute(Context.Get())) {}
+			const auto* Settings = CastChecked<UPCGExportSyntheticPointCloudSettings>(FindNode(AfterGraph.Get(), TEXT("ExportSyntheticPointCloud_0"))->GetSettings());
 			FString Json;
 			TSharedPtr<FJsonObject> Summary;
 			const FString Directory = FPaths::Combine(FPaths::ProjectSavedDir(), Settings->OutputSubdirectory);
 			const bool bReadSummary = FFileHelper::LoadFileToString(Json, *FPaths::Combine(Directory, TEXT("summary.json"))) && FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Json), Summary);
 			if (Test->TestTrue(TEXT("Real scene export writes summary"), bReadSummary))
 			{
+				Test->TestEqual(TEXT("PCG executor exports the generating component's editable seed"), Summary->GetIntegerField(TEXT("scene_seed")), ComponentSeed);
 				const auto Brick = Summary->GetObjectField(TEXT("classes"))->GetObjectField(TEXT("brick"));
 				Test->TestEqual(TEXT("Real summary matches final stream"), Brick->GetIntegerField(TEXT("instance_count")), After.BrickTransforms.Num());
 				Test->TestEqual(TEXT("Real unique IDs match final stream"), Brick->GetIntegerField(TEXT("unique_instance_count")), After.BrickTransforms.Num());
-				Test->TestTrue(TEXT("Real PLY written"), FPaths::FileExists(FPaths::Combine(Directory, TEXT("scene_0001_points.ply"))));
-				Test->TestTrue(TEXT("Real TXT written"), FPaths::FileExists(FPaths::Combine(Directory, TEXT("scene_0001_points.txt"))));
+				Test->TestTrue(TEXT("Real PLY written"), FPaths::FileExists(FPaths::Combine(Directory, Settings->BaseFileName + TEXT("_points.ply"))));
+				Test->TestTrue(TEXT("Real TXT written"), FPaths::FileExists(FPaths::Combine(Directory, Settings->BaseFileName + TEXT("_points.txt"))));
 			}
 			return true;
 		}
@@ -243,6 +247,8 @@ namespace GroundTruthSceneTests
 		TStrongObjectPtr<UPCGGraphInstance> OriginalGraph;
 		TStrongObjectPtr<UPCGGraph> BeforeGraph;
 		TStrongObjectPtr<UPCGGraph> AfterGraph;
+		TStrongObjectPtr<UPCGExportSyntheticPointCloudSettings> AssetExportSettings;
+		bool bAssetExportEnabled;
 		FCapture Before;
 	};
 }
@@ -261,8 +267,17 @@ void FGroundTruthSceneTest::GetTests(TArray<FString>& OutNames, TArray<FString>&
 
 bool FGroundTruthSceneTest::RunTest(const FString& Parameters)
 {
+	UPCGGraph* Asset = LoadObject<UPCGGraph>(nullptr, TEXT("/Game/DIPLOMA.DIPLOMA"));
+	if (!TestNotNull(TEXT("Scene graph exists"), Asset)) { return false; }
+	UPCGNode* ExportNode = GroundTruthSceneTests::FindNode(Asset, TEXT("ExportSyntheticPointCloud_0"));
+	if (!TestNotNull(TEXT("Scene exporter node exists"), ExportNode)) { return false; }
+	auto* Settings = CastChecked<UPCGExportSyntheticPointCloudSettings>(ExportNode->GetSettings());
+	const bool bOriginalEnabled = Settings->bExportEnabled;
+	// Suppress automatic map-load exports to the user's manual output directory.
+	// Restore this in-memory flag afterward; never save the asset.
+	Settings->bExportEnabled = false;
 	FAutomationEditorCommonUtils::LoadMap(TEXT("/Game/DIPLOMAS"));
-	FAutomationTestFramework::Get().EnqueueLatentCommand(MakeShared<GroundTruthSceneTests::FValidateScene>(this, Parameters));
+	FAutomationTestFramework::Get().EnqueueLatentCommand(MakeShared<GroundTruthSceneTests::FValidateScene>(this, Parameters, Settings, bOriginalEnabled));
 	return true;
 }
 

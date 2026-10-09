@@ -41,7 +41,7 @@ Example schema (counts are illustrative, not a measured scene baseline):
 
 ```json
 {
-  "scene_seed": null,
+  "scene_seed": 66,
   "classes": {
     "brick": {
       "class_id": 3,
@@ -63,19 +63,24 @@ affected class, and the object/unique-ID invariant has failed.
 
 ## Scene seed and historical counts
 
-The summary currently emits `scene_seed: null`. The existing C++ pipeline does
-not establish which scene-level seed was recorded in the historical baseline.
-`SamplingSeed` controls only surface sampling; the PCG execution seed can combine
-node and component seeds. Neither is substituted for the real scene seed.
-To fill this field, explicitly pass the confirmed scene-level generation seed
-through the dataset pipeline (for example, a named scene parameter/metadata with
-a defined producer), and validate that value before serialization. The source
-contains `TODO(SceneSeed)` at the serialization site.
+`scene_seed` is the editable `Seed` of the original generating `UPCGComponent`.
+The exporter casts `FPCGContext::ExecutionSource` to `UPCGComponent`, resolves
+`GetOriginalComponent()` for partition-local execution, and reads `Seed`.
+In UE 5.7 this property is `EditAnywhere` / `BlueprintReadWrite` in Settings;
+`FPCGComponentExecutionState::GetSeed()` returns that same property. Ordinary
+Generate/Regenerate schedules the component without replacing its seed.
+No extra seed metadata or graph wiring is required.
 
-`GROUND_TRUTH_BASELINE.md` records 66 -> 55, 70 -> 51 and 82 -> 56, but does not
-name `StaticMeshSpawner_12` or otherwise establish that those measurements came
-from `brick_stack`. They are retained as historical reference, not used as
-acceptance assertions or hardcoded into the exporter.
+`Context->GetSeed()` is deliberately not used: it passes through node settings,
+which can combine seeds or return a default for nodes with `UseSeed() == false`.
+`SamplingSeed` controls only surface sampling. Neither is the scene seed.
+Standalone exporter calls without a component execution source still emit
+`scene_seed: null` rather than inventing a value. Zero and negative component
+seeds are valid integers and are preserved.
+
+The user subsequently confirmed manual end-to-end results for the `brick_stack`
+branch: 66 -> 55, 70 -> 51 and 82 -> 56, with unique brick InstanceId counts
+matching each object count. These counts are not hardcoded into the exporter.
 
 ## Validation and manual graph review
 
@@ -105,6 +110,9 @@ Automation tests under `TestProject.GroundTruth.Export` execute the actual expor
 on multiple input batches and classes, varying surface sample counts. They verify
 object counts, unique IDs, duplicate diagnostics, zero bricks, disabled export,
 TXT/PLY schemas and record counts, and deterministic repeated PLY output.
+`TestProject.GroundTruth.Export.ComponentSeed` checks component-context seed
+serialization, including zero and negative seeds, with different node and
+sampling seeds. Existing standalone cases also verify the null-source fallback.
 On Windows, they also lock an existing summary and verify that a failed
 replacement preserves all three previous output files.
 
@@ -113,9 +121,13 @@ The opt-in `TestProject.GroundTruth.Scene.PreservePlacement` test loads the curr
 for each of its two active volumes, `DIPLOMA` (currently seed 82) and `DIPLOMA2`
 (currently seed 42). It reads `AddAttribute_16.Out`, the immediate final stream
 consumed by `StaticMeshSpawner_12`, compares brick transforms and counts, checks
-other class counts, and exports the real merged object points to a fresh
+other class counts, and enables the actual exporter node in the transient
+post-change graph. The normal PCG executor initializes its context from the
+generating component and writes to a fresh
 `Saved/Automation/GroundTruthScene/<actor label>/<run id>` directory. This prevents
-stale output from satisfying a failed export. An empty stream is accepted only
+stale output from satisfying a failed export. The summary seed must match the
+same component that generated those object points; the test no longer calls
+the exporter separately. An empty stream is accepted only
 when inspection confirms that the nodes executed and produced no output data;
 fully empty scenes retain the existing no-export behavior. The test temporarily
 disables editor auto-refresh to avoid racing explicit generations and restores
@@ -128,7 +140,9 @@ restored Fab-tab startup assertion during headless tests. These are temporary
 launch arguments, not project configuration changes.
 
 Local verification on UE 5.7 succeeded: the Win64 Development Editor build and
-all four automation cases passed. The duplicate-ID case emits the expected
+all five automation cases passed, including real PCG graph execution with
+`scene_seed = 82` and brick instance/unique counts `56 / 56`.
+The duplicate-ID case emits the expected
 existing warning; scene loading warns about an unavailable Fab material while
 Fab is disabled for the unattended launch.
 
@@ -140,5 +154,8 @@ Fab is disabled for the unattended launch.
 For DIPLOMA, brick transforms matched exactly and the other exported class
 (ClassId 0, 424 objects) was unchanged. TXT and PLY were generated successfully
 from the real scene. The local automation report is under
-`Saved/Automation/GroundTruthFinalReport`. Seeds 66 and 70 were not changed or
-tested; the historical baseline's branch provenance remains unconfirmed.
+`Saved/Automation/GroundTruthSeedReport`. The automated scene test did not change
+the scene's component seed; the 66/70/82 count baselines above were confirmed
+separately by the user's manual end-to-end checks before this seed change.
+The test suppresses map-load exports in memory and restores the asset's export
+flag afterward, so existing files in `Saved/SyntheticDataset` are not overwritten.

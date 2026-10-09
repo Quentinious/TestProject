@@ -3,6 +3,7 @@
 #include "PCG/PCGExportSyntheticPointCloudSettings.h"
 
 #include "PCGContext.h"
+#include "PCGComponent.h"
 #include "Data/PCGBasePointData.h"
 #include "Dom/JsonObject.h"
 #include "Engine/StaticMesh.h"
@@ -305,13 +306,20 @@ namespace PCGExportSyntheticPointCloud
 
 	bool WriteSummaryTemporaryFile(
 		const FString& Path,
+		const TOptional<int32>& SceneSeed,
 		const TMap<int32, int32>& InstanceCountsByClass,
 		const TMap<int32, TSet<int32>>& UniqueInstanceIdsByClass)
 	{
 		TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
-		// TODO(SceneSeed): pass an explicit scene-level seed through the dataset pipeline.
-		// SamplingSeed and the combined PCG execution seed are not the scene seed.
-		Root->SetField(TEXT("scene_seed"), MakeShared<FJsonValueNull>());
+		if (SceneSeed.IsSet())
+		{
+			Root->SetNumberField(TEXT("scene_seed"), SceneSeed.GetValue());
+		}
+		else
+		{
+			// Standalone execution without a PCG component has no scene seed.
+			Root->SetField(TEXT("scene_seed"), MakeShared<FJsonValueNull>());
+		}
 		TSharedRef<FJsonObject> Classes = MakeShared<FJsonObject>();
 		TArray<int32> ClassIds;
 		InstanceCountsByClass.GetKeys(ClassIds);
@@ -444,6 +452,17 @@ bool FPCGExportSyntheticPointCloudElement::ExecuteInternal(FPCGContext* Context)
 	if (!Settings->bExportEnabled)
 	{
 		return true;
+	}
+
+	TOptional<int32> SceneSeed;
+	if (const UPCGComponent* Component = Cast<UPCGComponent>(Context->ExecutionSource.Get()))
+	{
+		if (const UPCGComponent* OriginalComponent = Component->GetOriginalComponent())
+		{
+			// This is the editable component Seed, not Context->GetSeed() (node seed).
+			// Resolve partition-local execution back to the user's original component.
+			SceneSeed = OriginalComponent->Seed;
+		}
 	}
 
 	auto AbortExport = [Context](const FString& Message)
@@ -712,7 +731,7 @@ bool FPCGExportSyntheticPointCloudElement::ExecuteInternal(FPCGContext* Context)
 	SummaryOutput.FinalPath = SummaryPath;
 	SummaryOutput.TemporaryPath = SummaryPath + TEXT(".tmp.") + TransactionId;
 	SummaryOutput.BackupPath = SummaryPath + TEXT(".bak.") + TransactionId;
-	if (!PCGExportSyntheticPointCloud::WriteSummaryTemporaryFile(SummaryOutput.TemporaryPath, InstanceCountsByClass, UniqueInstanceIdsByClass))
+	if (!PCGExportSyntheticPointCloud::WriteSummaryTemporaryFile(SummaryOutput.TemporaryPath, SceneSeed, InstanceCountsByClass, UniqueInstanceIdsByClass))
 	{
 		PCGExportSyntheticPointCloud::CleanupTemporaryFiles(PlatformFile, PendingOutputs);
 		return AbortExport(FString::Printf(TEXT("Failed to write temporary summary output '%s'."), *SummaryOutput.TemporaryPath));
