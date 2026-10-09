@@ -302,6 +302,10 @@ bool FSyntheticDatasetBatch::ValidateExport(FString& Error)
 			Error = FString::Printf(TEXT("Exporter did not produce %s%s."), *ExportSettings->BaseFileName, Suffix); return false;
 		}
 	}
+	if (IFileManager::Get().FileSize(*FPaths::Combine(PendingRun.Directory, TEXT("instances.csv"))) <= 0)
+	{
+		Error = TEXT("Exporter did not produce instances.csv."); return false;
+	}
 	return true;
 }
 

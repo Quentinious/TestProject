@@ -64,6 +64,20 @@ namespace PCGExportSyntheticPointCloud
 		bool bCommitted = false;
 	};
 
+	struct FBrickInstanceBounds
+	{
+		int32 InstanceId = 0;
+		FVector SizeCm = FVector::ZeroVector;
+		double VolumeCm3 = 0.0;
+	};
+
+	struct FBrickBoundsStatistics
+	{
+		double Total = 0.0;
+		double Min = TNumericLimits<double>::Max();
+		double Max = 0.0;
+	};
+
 	bool IsFiniteVector(const FVector& Value)
 	{
 		return FMath::IsFinite(Value.X) && FMath::IsFinite(Value.Y) && FMath::IsFinite(Value.Z);
@@ -304,11 +318,32 @@ namespace PCGExportSyntheticPointCloud
 		return FFileHelper::SaveArrayToFile(MakeArrayView(Bytes), *Path);
 	}
 
+	bool WriteInstancesTemporaryFile(const FString& Path, const TOptional<int32>& SceneSeed, const TArray<FBrickInstanceBounds>& Instances)
+	{
+		FString Text = TEXT("SceneSeed,ClassId,InstanceId,BoundsXcm,BoundsYcm,BoundsZcm,BBoxVolumeCm3\n");
+		const FString Seed = SceneSeed.IsSet() ? FString::FromInt(SceneSeed.GetValue()) : FString();
+		const auto FormatDimension = [](double Value)
+		{
+			FString Number = FString::Printf(TEXT("%.17g"), Value);
+			Number.ReplaceInline(TEXT(","), TEXT("."));
+			return Number;
+		};
+		for (const FBrickInstanceBounds& Instance : Instances)
+		{
+			// Double round-trip precision; do not reuse the surface TXT's six-decimal formatter.
+			Text.Appendf(TEXT("%s,%d,%d,%s,%s,%s,%s\n"), *Seed, Constants::BrickClassId,
+				Instance.InstanceId, *FormatDimension(Instance.SizeCm.X), *FormatDimension(Instance.SizeCm.Y),
+				*FormatDimension(Instance.SizeCm.Z), *FormatDimension(Instance.VolumeCm3));
+		}
+		return FFileHelper::SaveStringToFile(Text, *Path, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+	}
+
 	bool WriteSummaryTemporaryFile(
 		const FString& Path,
 		const TOptional<int32>& SceneSeed,
 		const TMap<int32, int32>& InstanceCountsByClass,
-		const TMap<int32, TSet<int32>>& UniqueInstanceIdsByClass)
+		const TMap<int32, TSet<int32>>& UniqueInstanceIdsByClass,
+		const FBrickBoundsStatistics& BrickBounds)
 	{
 		TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 		if (SceneSeed.IsSet())
@@ -335,6 +370,24 @@ namespace PCGExportSyntheticPointCloud
 			Class->SetNumberField(TEXT("instance_count"), InstanceCount);
 			Class->SetNumberField(TEXT("unique_instance_count"), UniqueCount);
 			Class->SetBoolField(TEXT("instance_ids_unique"), InstanceCount == UniqueCount);
+			if (ClassId == Constants::BrickClassId)
+			{
+				Class->SetStringField(TEXT("bbox_definition"), TEXT("world_aabb_lod0_triangle_vertices"));
+				Class->SetNumberField(TEXT("total_bbox_volume_cm3"), BrickBounds.Total);
+				if (InstanceCount > 0)
+				{
+					Class->SetNumberField(TEXT("mean_bbox_volume_cm3"), BrickBounds.Total / InstanceCount);
+					Class->SetNumberField(TEXT("min_bbox_volume_cm3"), BrickBounds.Min);
+					Class->SetNumberField(TEXT("max_bbox_volume_cm3"), BrickBounds.Max);
+				}
+				else
+				{
+					for (const TCHAR* Field : {TEXT("mean_bbox_volume_cm3"), TEXT("min_bbox_volume_cm3"), TEXT("max_bbox_volume_cm3")})
+					{
+						Class->SetField(Field, MakeShared<FJsonValueNull>());
+					}
+				}
+			}
 			Classes->SetObjectField(ClassId == Constants::BrickClassId ? TEXT("brick") : FString::Printf(TEXT("class_%d"), ClassId), Class);
 		}
 		Root->SetObjectField(TEXT("classes"), Classes);
@@ -492,6 +545,8 @@ bool FPCGExportSyntheticPointCloudElement::ExecuteInternal(FPCGContext* Context)
 	TArray<PCGExportSyntheticPointCloud::FTriangle> Triangles;
 	TMap<int32, int32> InstanceCountsByClass;
 	TMap<int32, TSet<int32>> UniqueInstanceIdsByClass;
+	TArray<PCGExportSyntheticPointCloud::FBrickInstanceBounds> BrickInstances;
+	PCGExportSyntheticPointCloud::FBrickBoundsStatistics BrickBounds;
 	TSet<int32> UniqueInstanceIds;
 	bool bFoundDuplicateInstanceId = false;
 	int32 InputInstanceCount = 0;
@@ -584,6 +639,8 @@ bool FPCGExportSyntheticPointCloudElement::ExecuteInternal(FPCGContext* Context)
 				return AbortExport(MeshContext + TEXT(" has no valid LOD 0 triangle index buffer."));
 			}
 
+			FBox InstanceBoundsCm(ForceInit);
+			const bool bIsBrick = ClassId == PCGExportSyntheticPointCloud::Constants::BrickClassId;
 			const int32 TrianglesBeforeInstance = Triangles.Num();
 			for (int32 IndexOffset = 0; IndexOffset < Indices.Num(); IndexOffset += 3)
 			{
@@ -601,6 +658,14 @@ bool FPCGExportSyntheticPointCloudElement::ExecuteInternal(FPCGContext* Context)
 				if (!PCGExportSyntheticPointCloud::IsFiniteVector(A) || !PCGExportSyntheticPointCloud::IsFiniteVector(B) || !PCGExportSyntheticPointCloud::IsFiniteVector(C))
 				{
 					return AbortExport(MeshContext + TEXT(" produced a non-finite world-space vertex."));
+				}
+				if (bIsBrick)
+				{
+					// Tight world AABB of the exported mesh geometry, including instance scale/rotation.
+					// Never read PCG point bounds or UStaticMesh extended/culling bounds.
+					InstanceBoundsCm += A;
+					InstanceBoundsCm += B;
+					InstanceBoundsCm += C;
 				}
 
 				const double Area = 0.5 * FVector::CrossProduct(B - A, C - A).Length();
@@ -632,6 +697,20 @@ bool FPCGExportSyntheticPointCloudElement::ExecuteInternal(FPCGContext* Context)
 			if (Triangles.Num() == TrianglesBeforeInstance)
 			{
 				return AbortExport(MeshContext + TEXT(" has no non-degenerate LOD 0 triangles after applying its point transform."));
+			}
+			if (bIsBrick)
+			{
+				const FVector SizeCm = InstanceBoundsCm.GetSize();
+				const double VolumeCm3 = SizeCm.X * SizeCm.Y * SizeCm.Z;
+				if (!PCGExportSyntheticPointCloud::IsFiniteVector(SizeCm) || SizeCm.GetMin() <= 0.0 ||
+					!FMath::IsFinite(VolumeCm3) || VolumeCm3 <= 0.0 || !FMath::IsFinite(BrickBounds.Total + VolumeCm3))
+				{
+					return AbortExport(MeshContext + TEXT(" has invalid/non-positive geometric bounding dimensions or volume."));
+				}
+				BrickInstances.Add({InstanceId, SizeCm, VolumeCm3});
+				BrickBounds.Total += VolumeCm3;
+				BrickBounds.Min = FMath::Min(BrickBounds.Min, VolumeCm3);
+				BrickBounds.Max = FMath::Max(BrickBounds.Max, VolumeCm3);
 			}
 		}
 	}
@@ -699,6 +778,7 @@ bool FPCGExportSyntheticPointCloudElement::ExecuteInternal(FPCGContext* Context)
 	const FString TxtPath = FPaths::Combine(OutputDirectory, Settings->BaseFileName + TEXT("_points.txt"));
 	const FString PlyPath = FPaths::Combine(OutputDirectory, Settings->BaseFileName + TEXT("_points.ply"));
 	const FString SummaryPath = FPaths::Combine(OutputDirectory, TEXT("summary.json"));
+	const FString InstancesPath = FPaths::Combine(OutputDirectory, TEXT("instances.csv"));
 	TArray<PCGExportSyntheticPointCloud::FPendingOutput> PendingOutputs;
 
 	if (Settings->bWriteTxt)
@@ -727,11 +807,21 @@ bool FPCGExportSyntheticPointCloudElement::ExecuteInternal(FPCGContext* Context)
 		}
 	}
 
+	PCGExportSyntheticPointCloud::FPendingOutput& InstancesOutput = PendingOutputs.Emplace_GetRef();
+	InstancesOutput.FinalPath = InstancesPath;
+	InstancesOutput.TemporaryPath = InstancesPath + TEXT(".tmp.") + TransactionId;
+	InstancesOutput.BackupPath = InstancesPath + TEXT(".bak.") + TransactionId;
+	if (!PCGExportSyntheticPointCloud::WriteInstancesTemporaryFile(InstancesOutput.TemporaryPath, SceneSeed, BrickInstances))
+	{
+		PCGExportSyntheticPointCloud::CleanupTemporaryFiles(PlatformFile, PendingOutputs);
+		return AbortExport(FString::Printf(TEXT("Failed to write temporary instance output '%s'."), *InstancesOutput.TemporaryPath));
+	}
+
 	PCGExportSyntheticPointCloud::FPendingOutput& SummaryOutput = PendingOutputs.Emplace_GetRef();
 	SummaryOutput.FinalPath = SummaryPath;
 	SummaryOutput.TemporaryPath = SummaryPath + TEXT(".tmp.") + TransactionId;
 	SummaryOutput.BackupPath = SummaryPath + TEXT(".bak.") + TransactionId;
-	if (!PCGExportSyntheticPointCloud::WriteSummaryTemporaryFile(SummaryOutput.TemporaryPath, SceneSeed, InstanceCountsByClass, UniqueInstanceIdsByClass))
+	if (!PCGExportSyntheticPointCloud::WriteSummaryTemporaryFile(SummaryOutput.TemporaryPath, SceneSeed, InstanceCountsByClass, UniqueInstanceIdsByClass, BrickBounds))
 	{
 		PCGExportSyntheticPointCloud::CleanupTemporaryFiles(PlatformFile, PendingOutputs);
 		return AbortExport(FString::Printf(TEXT("Failed to write temporary summary output '%s'."), *SummaryOutput.TemporaryPath));
@@ -771,7 +861,8 @@ bool FPCGExportSyntheticPointCloudElement::ExecuteInternal(FPCGContext* Context)
 		TEXT("Point counts by ClassId:%s\n")
 		TEXT("TXT = %s\n")
 		TEXT("PLY = %s\n")
-		TEXT("Summary = %s"),
+		TEXT("Summary = %s\n")
+		TEXT("Instances = %s"),
 		InputInstanceCount,
 		Triangles.Num(),
 		*TotalAreaMetersText,
@@ -784,7 +875,8 @@ bool FPCGExportSyntheticPointCloudElement::ExecuteInternal(FPCGContext* Context)
 		*PCGExportSyntheticPointCloud::FormatClassCounts(PointCountsByClass),
 		Settings->bWriteTxt ? *TxtPath : TEXT("disabled"),
 		Settings->bWritePly ? *PlyPath : TEXT("disabled"),
-		*SummaryPath);
+		*SummaryPath,
+		*InstancesPath);
 	PCGE_LOG_C(Display, GraphAndLog, Context, FText::FromString(Summary));
 
 	return true;

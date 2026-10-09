@@ -22,6 +22,7 @@ The default output is:
 ```text
 Saved/SyntheticDataset/Runs/
   seed_66/summary.json
+  seed_66/instances.csv
   seed_66/construction_poc_001_points.ply
   seed_66/construction_poc_001_points.txt
   seed_70/...
@@ -81,6 +82,7 @@ Each run requires:
 - `instance_count == unique_instance_count == actual final brick object count`;
 - `instance_ids_unique == true`;
 - non-empty TXT and PLY outputs.
+- `instances.csv` from the same exporter transaction (one row per brick).
 
 Captured ClassId 3 transforms must also differ from every previous run. The
 55/51/56 baseline counts are asserted by the integration test, not hardcoded
@@ -106,6 +108,11 @@ command and runs the real `/Game/DIPLOMA` graph through all three seeds. It chec
 55/51/56 objects, the controller's per-run summary/identity/file checks and
 restoration. Its outputs use a fresh
 `Saved/SyntheticDataset/Runs/validation_<run id>/seed_<n>` root.
+It also verifies that CSV brick rows equal summary instance/unique counts, each
+dimension and box volume is finite and positive, each volume equals X * Y * Z,
+and summary total/mean/min/max match CSV (relative tolerance 1e-9). Bounds use
+the final transformed LOD 0 geometry's world AABB; see
+[geometric baseline semantics](GROUND_TRUTH_EXPORT.md#geometric-bounding-volume-baseline-brick-class-3).
 `ExternalSeedEditStopsBatch` changes Seed after generation and confirms failure
 before writing any run or proceeding to later seeds. Additional checks cover
 concurrent starts, existing output rejection, missing component and command registration.
@@ -116,12 +123,14 @@ PCG execution. Local launches use `-DDC-ForceMemoryCache`; the existing test set
 also uses `-ddc=InstalledNoZenLocalFallback -DisablePlugins=Fab -RenderOffscreen`.
 These are process arguments, not project/DDC configuration changes.
 
-Local UE 5.7 validation passed: Win64 Development Editor build and all eight
+Local UE 5.7 validation passed: Win64 Development Editor build and all nine
 ground-truth cases, including the console-command integration and interrupted
 batch case. Each successful run contains 200,000 TXT/PLY records and summary
-seed/count/unique values `66/55/55`, `70/51/51`, `82/56/56`. Point positions differ
+seed/count/unique values `66/55/55`, `70/51/51`, `82/56/56`, plus instances.csv
+with matching brick rows and verified bounding volumes. TXT/PLY SHA-256 hashes
+match the previous pre-volume batch for each seed. Point positions differ
 between every pair of runs. Existing missing environment asset/material warnings
 appear during map loading; no test errors remain.
-The report is in `Saved/Automation/SyntheticBatchReport`. The most recent local
+The report is in `Saved/Automation/BoundingVolumesReport`. The most recent local
 three-run output is
-`Saved/SyntheticDataset/Runs/validation_826A82EF4445935BACCEBA91D825EE3F`.
+`Saved/SyntheticDataset/Runs/validation_D754411D4557FB1A38A9A2BF07B63FCF`.

@@ -11,6 +11,7 @@
 #include "Misc/Guid.h"
 #include "Misc/Paths.h"
 #include "Tests/AutomationEditorCommon.h"
+#include "Tests/GroundTruthBoundsTestUtils.h"
 
 namespace SyntheticDatasetBatchTests
 {
@@ -105,7 +106,9 @@ namespace SyntheticDatasetBatchTests
 					Test->TestEqual(TEXT("Requested seed order"), Run.Seed, Seeds[Index]);
 					Test->TestEqual(TEXT("Confirmed brick_stack baseline"), Run.BrickCount, Counts[Index]);
 					Test->TestEqual(TEXT("Actual brick transforms captured"), Run.BrickTransforms.Num(), Counts[Index]);
-					Test->AddInfo(FString::Printf(TEXT("Seed %d: brick=%d, unique=%d, verified scene_seed and TXT/PLY; %s"), Run.Seed, Run.BrickCount, Run.BrickCount, *Run.Directory));
+					TArray<GroundTruthBoundsTests::FRow> Rows;
+					GroundTruthBoundsTests::Validate(*Test, Run.Directory, Run.Seed, Counts[Index], Counts[Index], Rows);
+					Test->AddInfo(FString::Printf(TEXT("Seed %d: brick=%d, unique=%d, verified scene_seed, TXT/PLY, instance CSV dimensions/volumes and summary aggregates; %s"), Run.Seed, Run.BrickCount, Run.BrickCount, *Run.Directory));
 				}
 				FString Error;
 				Test->TestFalse(TEXT("Existing runs cannot satisfy a new batch through stale files"), FSyntheticDatasetBatch::Start(Component.Get(), {66, 70, 82}, Root, Error).IsValid());

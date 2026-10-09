@@ -1,6 +1,6 @@
 # Ground-truth instance summary
 
-The existing `Export Synthetic Point Cloud` node writes `summary.json` alongside
+The existing `Export Synthetic Point Cloud` node writes `summary.json` and `instances.csv` alongside
 `<BaseFileName>_points.txt` and `<BaseFileName>_points.ply` under
 `Saved/<OutputSubdirectory>`. The existing export enable switch and point-cloud
 formats are unchanged. All enabled outputs, including the summary, participate
@@ -61,6 +61,87 @@ Duplicate IDs retain the existing warning and export behavior; object counts are
 not silently deduplicated. In that case, `instance_ids_unique` is false for the
 affected class, and the object/unique-ID invariant has failed.
 
+## Geometric bounding-volume baseline (brick class 3)
+
+`instances.csv` contains exactly one row per final brick object point, across all
+input batches, before surface sampling. Other classes are not included yet:
+
+```csv
+SceneSeed,ClassId,InstanceId,BoundsXcm,BoundsYcm,BoundsZcm,BBoxVolumeCm3
+```
+
+The seed and IDs are the same values used by the existing summary and point
+cloud. An unknown component seed is an empty CSV field and remains JSON null.
+Duplicate IDs still produce separate object rows and the existing warning;
+they are not silently deduplicated. With no bricks, CSV contains only its header.
+
+The definition is **the tight world-axis-aligned bounding box of the selected
+Static Mesh's indexed LOD 0 vertices, transformed by the final point transform**.
+These are the same mesh path, transform and triangle vertices already consumed
+by the point-cloud exporter. Bounds include translation, rotation and actual
+non-uniform/negative instance scale; dimensions are `max - min` in Unreal
+centimeters. Import/build scale is already reflected in the built vertices.
+`BBoxVolumeCm3 = BoundsXcm * BoundsYcm * BoundsZcm`. Rotation can change this
+world AABB's dimensions and volume. This is a geometric box baseline, **not
+MeshVolume or the physical volume of material**. It describes the nominal LOD 0
+geometry used by this exporter, including a mesh's fallback representation where
+applicable; it does not measure collision geometry or material vertex displacement.
+
+UE 5.7 source verification:
+
+- `PCGMeshSelectorWeighted.cpp::SelectInstances` copies the point transform to
+  the instance list; `PCGStaticMeshSpawner.cpp::SpawnStaticMeshInstances` calls
+  `ISMC->AddInstances(..., bWorldSpace=true)`.
+- The GPU spawner used by brick_stack does the same in
+  `PCGStaticMeshSpawner.usf`: `In_GetPointTransform` feeds
+  `InstanceData_WriteInstanceLocalToWorld`, and output scale is copied unchanged.
+- `PCGStaticMeshSpawner.cpp` only replaces point bounds if
+  `bApplyMeshBoundsToPoints` is enabled; otherwise earlier placement bounds can
+  survive. `UStaticMesh::GetBoundingBox()` in `StaticMesh.cpp` returns
+  `GetExtendedBounds().GetBox()`, which can include positive/negative padding.
+
+Consequently, neither PCG BoundsMin/BoundsMax nor UStaticMesh extended bounds are
+read for this baseline. The exporter accumulates transformed triangle vertices
+before filtering degenerate triangles, so surface sampling cannot affect it.
+This avoids Bounds Modifier, Difference, Self Pruning and spacing bounds, as
+well as optional mesh culling bounds extensions, without modifying any asset.
+
+`classes.brick` retains its count/identity fields and adds:
+
+| Field | Meaning |
+| --- | --- |
+| `bbox_definition` | `world_aabb_lod0_triangle_vertices` |
+| `total_bbox_volume_cm3` | Sum of per-object box volumes, without union/overlap subtraction |
+| `mean_bbox_volume_cm3` | Total divided by brick object count |
+| `min_bbox_volume_cm3` | Smallest per-object box volume |
+| `max_bbox_volume_cm3` | Largest per-object box volume |
+
+For zero bricks, total is 0 and mean/min/max are null (undefined). Each actual
+brick requires finite, strictly positive dimensions and volume; otherwise the
+whole export aborts before replacing any previous output. CSV uses double
+round-trip precision. It joins TXT, PLY and summary in the same four-file
+temporary/backup/rollback transaction, preventing mixed runs on write failure.
+
+`TestProject.GroundTruth.Export.BoundingVolumes` uses the 100 cm engine cube to
+verify analytic dimensions under translation, non-uniform/negative scale and
+90/45 degree rotations, with deliberately inflated PCG bounds. It checks
+sample-count independence, preserved IDs and invalid-volume rejection. Existing
+multi-batch, duplicate-ID and zero-brick tests now validate CSV and aggregates;
+Windows rollback tests lock both CSV and summary and check all four files.
+`TestProject.GroundTruth.Batch.ThreeSeeds` generates the real scene at 66/70/82
+and verifies CSV row counts 55/51/56, matching summary counts and unique IDs,
+positive dimensions/volumes, products and all aggregates (relative tolerance
+1e-9). TXT/PLY schemas and sampling are unchanged.
+
+Local UE 5.7 verification passed: Win64 Development Editor build and all nine
+ground-truth automation cases (zero test errors). The three real batch runs
+produce CSV row/instance/unique counts 55/55/55, 51/51/51 and 56/56/56. Their
+TXT and PLY SHA-256 hashes are identical to the previous pre-volume batch for
+each seed. Graph/map hashes are unchanged, and Content, Config and the uproject
+have no tracked changes. Existing unrelated asset loading diagnostics remain.
+The report is `Saved/Automation/BoundingVolumesReport/index.json`; the outputs
+are in `Saved/SyntheticDataset/Runs/validation_D754411D4557FB1A38A9A2BF07B63FCF`.
+
 ## Scene seed and historical counts
 
 `scene_seed` is the editable `Seed` of the original generating `UPCGComponent`.
@@ -114,7 +195,7 @@ TXT/PLY schemas and record counts, and deterministic repeated PLY output.
 serialization, including zero and negative seeds, with different node and
 sampling seeds. Existing standalone cases also verify the null-source fallback.
 On Windows, they also lock an existing summary and verify that a failed
-replacement preserves all three previous output files.
+replacement preserves all four previous output files.
 
 The opt-in `TestProject.GroundTruth.Scene.PreservePlacement` test loads the current
 `/Game/DIPLOMAS` map and compares transient pre-change and post-change graph copies
@@ -139,7 +220,7 @@ fails, `-ddc=InstalledNoZenLocalFallback`). `-DisablePlugins=Fab` avoids a local
 restored Fab-tab startup assertion during headless tests. These are temporary
 launch arguments, not project configuration changes.
 
-Local verification on UE 5.7 succeeded: the Win64 Development Editor build and
+The earlier seed-only verification on UE 5.7 succeeded: the Win64 Development Editor build and
 all five automation cases passed, including real PCG graph execution with
 `scene_seed = 82` and brick instance/unique counts `56 / 56`.
 The duplicate-ID case emits the expected

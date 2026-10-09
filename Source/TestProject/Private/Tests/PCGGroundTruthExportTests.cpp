@@ -15,6 +15,7 @@
 #include "Misc/Paths.h"
 #include "Serialization/JsonSerializer.h"
 #include "UObject/StrongObjectPtr.h"
+#include "Tests/GroundTruthBoundsTestUtils.h"
 
 namespace GroundTruthExportTests
 {
@@ -103,6 +104,8 @@ bool FGroundTruthExportCountsTest::RunTest(const FString& Parameters)
 		TestEqual(TEXT("Unknown classes retained"), Classes->GetObjectField(TEXT("class_7"))->GetIntegerField(TEXT("instance_count")), 1);
 
 		const FString Directory = FPaths::Combine(FPaths::ProjectSavedDir(), Settings->OutputSubdirectory);
+		TArray<GroundTruthBoundsTests::FRow> Rows;
+		if (!GroundTruthBoundsTests::Validate(*this, Directory, {}, 3, 3, Rows)) { return false; }
 		FString Txt;
 		TestTrue(TEXT("TXT written"), FFileHelper::LoadFileToString(Txt, *FPaths::Combine(Directory, TEXT("scene_0001_points.txt"))));
 		TArray<FString> Lines;
@@ -140,6 +143,9 @@ bool FGroundTruthExportDuplicatesTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("Objects are not silently deduplicated"), Brick->GetIntegerField(TEXT("instance_count")), 3);
 	TestEqual(TEXT("Unique IDs counted separately"), Brick->GetIntegerField(TEXT("unique_instance_count")), 2);
 	TestFalse(TEXT("Broken identity invariant is reported"), Brick->GetBoolField(TEXT("instance_ids_unique")));
+	const FString Directory = FPaths::Combine(FPaths::ProjectSavedDir(), Settings->OutputSubdirectory);
+	TArray<GroundTruthBoundsTests::FRow> Rows;
+	if (!GroundTruthBoundsTests::Validate(*this, Directory, {}, 3, 2, Rows)) { return false; }
 	TStrongObjectPtr<UPCGPointArrayData> NoBricks(MakeInstances({0}, {0}));
 	Export(Settings.Get(), {NoBricks.Get()});
 	Summary = ReadSummary(Settings->OutputSubdirectory);
@@ -147,28 +153,32 @@ bool FGroundTruthExportDuplicatesTest::RunTest(const FString& Parameters)
 	Brick = Summary->GetObjectField(TEXT("classes"))->GetObjectField(TEXT("brick"));
 	TestEqual(TEXT("No bricks reports zero"), Brick->GetIntegerField(TEXT("instance_count")), 0);
 	TestEqual(TEXT("No brick IDs reports zero"), Brick->GetIntegerField(TEXT("unique_instance_count")), 0);
+	if (!GroundTruthBoundsTests::Validate(*this, Directory, {}, 0, 0, Rows)) { return false; }
 
 #if PLATFORM_WINDOWS
-	// A locked existing summary must roll the TXT/PLY replacements back as well.
-	const FString Directory = FPaths::Combine(FPaths::ProjectSavedDir(), Settings->OutputSubdirectory);
+	// Locked object metadata must roll all four outputs back together.
 	TArray<TArray<uint8>> Originals;
-	for (const TCHAR* Name : {TEXT("scene_0001_points.txt"), TEXT("scene_0001_points.ply"), TEXT("summary.json")})
+	const TArray<const TCHAR*> Names = {TEXT("scene_0001_points.txt"), TEXT("scene_0001_points.ply"), TEXT("instances.csv"), TEXT("summary.json")};
+	for (const TCHAR* Name : Names)
 	{
 		FFileHelper::LoadFileToArray(Originals.Emplace_GetRef(), *FPaths::Combine(Directory, Name));
 	}
+	for (const TCHAR* LockedName : {TEXT("instances.csv"), TEXT("summary.json")})
 	{
-		TUniquePtr<IFileHandle> Lock(FPlatformFileManager::Get().GetPlatformFile().OpenRead(*FPaths::Combine(Directory, TEXT("summary.json"))));
-		if (!TestTrue(TEXT("Existing summary locked for rollback test"), Lock.IsValid())) { return false; }
-		Settings->TargetPointCount = 2;
-		AddExpectedError(TEXT("Could not stage existing output"), EAutomationExpectedErrorFlags::Contains, 1);
-		Export(Settings.Get(), {NoBricks.Get()});
-	}
-	int32 FileIndex = 0;
-	for (const TCHAR* Name : {TEXT("scene_0001_points.txt"), TEXT("scene_0001_points.ply"), TEXT("summary.json")})
-	{
-		TArray<uint8> Current;
-		FFileHelper::LoadFileToArray(Current, *FPaths::Combine(Directory, Name));
-		TestTrue(FString::Printf(TEXT("Failed summary replacement preserves %s"), Name), Current == Originals[FileIndex++]);
+		{
+			TUniquePtr<IFileHandle> Lock(FPlatformFileManager::Get().GetPlatformFile().OpenRead(*FPaths::Combine(Directory, LockedName)));
+			if (!TestTrue(TEXT("Existing metadata locked for rollback test"), Lock.IsValid())) { return false; }
+			Settings->TargetPointCount = 2;
+			AddExpectedError(TEXT("Could not stage existing output"), EAutomationExpectedErrorFlags::Contains, 1);
+			Export(Settings.Get(), {Batch.Get()});
+		}
+		int32 FileIndex = 0;
+		for (const TCHAR* Name : Names)
+		{
+			TArray<uint8> Current;
+			FFileHelper::LoadFileToArray(Current, *FPaths::Combine(Directory, Name));
+			TestTrue(FString::Printf(TEXT("Failed metadata replacement preserves %s"), Name), Current == Originals[FileIndex++]);
+		}
 	}
 #endif
 
@@ -200,6 +210,59 @@ bool FGroundTruthComponentSeedTest::RunTest(const FString& Parameters)
 		if (!TestTrue(TEXT("Component-context summary readable"), Summary.IsValid())) { return false; }
 		TestEqual(TEXT("Component seed serialized exactly, including zero and negative values"), Summary->GetIntegerField(TEXT("scene_seed")), Seed);
 	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGroundTruthBoundingVolumesTest, "TestProject.GroundTruth.Export.BoundingVolumes", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGroundTruthBoundingVolumesTest::RunTest(const FString& Parameters)
+{
+	using namespace GroundTruthExportTests;
+	TStrongObjectPtr<UPCGExportSyntheticPointCloudSettings> Settings(NewObject<UPCGExportSyntheticPointCloudSettings>());
+	Settings->bExportEnabled = true;
+	Settings->OutputSubdirectory = TEXT("Automation/GroundTruthExports/") + FGuid::NewGuid().ToString(EGuidFormats::Digits);
+	TStrongObjectPtr<UPCGPointArrayData> Batch(MakeInstances({3, 3, 3, 3, 0}, {10, 20, 30, 40, 50}));
+	Batch->AllocateProperties(EPCGPointNativeProperties::BoundsMin | EPCGPointNativeProperties::BoundsMax);
+	auto Transforms = Batch->GetTransformValueRange();
+	Transforms[1] = FTransform(FQuat::Identity, FVector(12345, -6789, 400), FVector(2, 3, 4));
+	Transforms[2] = FTransform(FRotator(0, 90, 0), FVector(1000, 2000, 3000), FVector(-2, 3, 0.5));
+	Transforms[3] = FTransform(FRotator(0, 45, 0), FVector(-2000, 3000, -4000), FVector(2, 1, 3));
+	// Deliberately unrelated spacing/pruning bounds: geometry must still be the 100 cm engine cube.
+	auto BoundsMin = Batch->GetBoundsMinValueRange();
+	auto BoundsMax = Batch->GetBoundsMaxValueRange();
+	for (int32 Index = 0; Index < Batch->GetNumPoints(); ++Index)
+	{
+		BoundsMin[Index] = FVector(-100000); BoundsMax[Index] = FVector(100000);
+	}
+	TStrongObjectPtr<UPCGComponent> Component(NewObject<UPCGComponent>());
+	Component->Seed = 66;
+	const FString Directory = FPaths::Combine(FPaths::ProjectSavedDir(), Settings->OutputSubdirectory);
+	const double Diagonal = 300.0 / FMath::Sqrt(2.0);
+	const TArray<FVector> ExpectedSizes = {FVector(100), FVector(200, 300, 400), FVector(300, 200, 50), FVector(Diagonal, Diagonal, 300)};
+	FString OriginalCsv;
+	for (int32 Samples : {1, 257})
+	{
+		Settings->TargetPointCount = Samples;
+		Export(Settings.Get(), {Batch.Get()}, Component.Get());
+		TArray<GroundTruthBoundsTests::FRow> Rows;
+		if (!GroundTruthBoundsTests::Validate(*this, Directory, 66, 4, 4, Rows) || Rows.Num() != 4) { return false; }
+		for (int32 Index = 0; Index < Rows.Num(); ++Index)
+		{
+			TestEqual(TEXT("InstanceId unchanged"), Rows[Index].InstanceId, (Index + 1) * 10);
+			TestTrue(TEXT("Analytic world AABB of cube: translation, rotation, non-uniform/negative scale; no PCG padding"), Rows[Index].SizeCm.Equals(ExpectedSizes[Index], 1.e-8));
+		}
+		FString Csv;
+		FFileHelper::LoadFileToString(Csv, *FPaths::Combine(Directory, TEXT("instances.csv")));
+		if (Samples == 1) { OriginalCsv = Csv; }
+		else { TestEqual(TEXT("Object metadata independent of surface sampling"), Csv, OriginalCsv); }
+	}
+	// Flattened geometry can have positive surface area, but cannot supply a positive 3D box.
+	Batch->GetTransformValueRange()[0] = FTransform(FQuat::Identity, FVector::ZeroVector, FVector(1, 1, 0));
+	AddExpectedError(TEXT("invalid/non-positive geometric bounding dimensions or volume"), EAutomationExpectedErrorFlags::Contains, 1);
+	Export(Settings.Get(), {Batch.Get()}, Component.Get());
+	FString AfterFailure;
+	FFileHelper::LoadFileToString(AfterFailure, *FPaths::Combine(Directory, TEXT("instances.csv")));
+	TestEqual(TEXT("Invalid bounding volume abort preserves previous metadata"), AfterFailure, OriginalCsv);
 	return true;
 }
 
